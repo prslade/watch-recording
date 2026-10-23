@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Turn a narrated screen recording into a transcript + time-aligned frames.
+
+Usage: watch-recording [path/to/recording.mov]
+  No argument: uses the newest video in ~/Desktop/screen-recordings-for-agents.
+
+Writes ~/.cache/watch-recording/<name>/ containing report.md (transcript with a
+frame path under each segment) and the frame JPEGs. Prints the report path.
+
+Frames: one every BASE_STEP_S seconds (dropping any screen identical to the last
+one kept), plus one in the middle of every spoken segment and one at every pointing
+word ("this", "here", ...). The reader is expected to look at all of them.
+
+Env: WATCH_ENGINE=whisper|parakeet (default whisper), WATCH_MAX_FRAMES (default 150),
+WATCH_INBOX (folder searched when no argument is given), WATCH_VOCAB (whisper name hints).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+INBOX = Path(os.environ.get("WATCH_INBOX", Path.home() / "Desktop" / "screen-recordings-for-agents"))
+CACHE = Path.home() / ".cache" / "watch-recording"
+MODEL = Path.home() / ".local" / "share" / "whisper" / "ggml-small.en.bin"
+PARAKEET = Path.home() / ".local" / "share" / "parakeet-venv" / "bin" / "parakeet-mlx"
+ENGINE = os.environ.get("WATCH_ENGINE", "whisper")
+VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".webm"}
+# Primes whisper toward words it would otherwise mishear (parakeet has no prompt).
+# Set WATCH_VOCAB to a comma-separated list of product and people names you say often.
+VOCAB = os.environ.get("WATCH_VOCAB", "")
+POINT_WORDS = {"this", "here", "these", "those", "there"}
+FRAME_WIDTH = 1600
+BASE_STEP_S = 2.0
+MAX_FRAMES = int(os.environ.get("WATCH_MAX_FRAMES", "150"))  # a runaway guard, not a token budget
+MIN_GAP_S = 0.8      # frames closer than this are the same moment
+# Change detection on a 160x90 grayscale thumbnail, in 5x5-pixel blocks. The largest
+# block-mean change against the last kept frame decides whether the screen moved; a
+# cursor crossing blocks or a new annotation clears it, compression noise does not.
+TW, TH, BLK = 160, 90, 5
+STATIC_DIFF = 2.0
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
+
+
+def resolve(arg):
+    """Accept pasted paths: unescape '\\ ' and restore the U+202F macOS puts before AM/PM."""
+    p = Path(arg.replace("\\ ", " ")).expanduser()
+    if p.exists():
+        return p
+    alt = Path(re.sub(r" (AM|PM)\.", "\u202f\\1.", str(p)))
+    return alt if alt.exists() else p
+
+
+def newest_video():
+    vids = [p for p in INBOX.iterdir() if p.suffix.lower() in VIDEO_EXTS]
+    if not vids:
+        sys.exit(f"No videos in {INBOX}")
+    return max(vids, key=lambda p: p.stat().st_mtime)
+
+
+def fmt(t):
+    t = int(t)
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+
+def has_audio(video):
+    out = run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+               "stream=index", "-of", "csv=p=0", str(video)]).stdout
+    return bool(out.strip())
+
+
+def duration(video):
+    return float(run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                      "-of", "csv=p=0", str(video)]).stdout)
+
+
+def is_noise(text):
+    return text[0] in "[(" and text[-1] in "])"  # [BLANK_AUDIO], (silence), [rushing water]
+
+
+def transcribe_whisper(wav, out):
+    prefix = out / "transcript"
+    prompt = ["--prompt", VOCAB] if VOCAB else []
+    run(["whisper-cli", "-m", str(MODEL), "-f", str(wav), "-l", "en", "-t", "8",
+         *prompt, "-ojf", "-of", str(prefix), "-np"])
+    segs, noise, words = [], set(), []
+    for s in json.loads(prefix.with_suffix(".json").read_text())["transcription"]:
+        text = s["text"].strip()
+        if not text:
+            continue
+        if is_noise(text):
+            noise.add(text)
+            continue
+        segs.append((s["offsets"]["from"] / 1000, s["offsets"]["to"] / 1000, text))
+        for tok in s.get("tokens", []):
+            w = tok["text"].strip().lower().strip(".,?!")
+            if not tok["text"].startswith("[_") and w in POINT_WORDS:
+                words.append((tok["offsets"]["from"] / 1000, w))
+    return segs, noise, words
+
+
+def transcribe_parakeet(wav, out):
+    run([str(PARAKEET), str(wav), "--output-format", "json", "--output-dir", str(out)])
+    segs, words = [], []
+    for s in json.loads((out / "audio.json").read_text())["sentences"]:
+        text = s["text"].strip()
+        if not text:
+            continue
+        segs.append((s["start"], s["end"], text))
+        cur, start = "", 0.0
+        for tok in s["tokens"] + [{"text": " ", "start": s["end"]}]:  # sentinel flushes the last word
+            if tok["text"].startswith(" ") and cur:
+                w = cur.lower().strip(".,?!")
+                if w in POINT_WORDS:
+                    words.append((start, w))
+                cur = ""
+            if not cur:
+                start = tok["start"]
+            cur += tok["text"].strip()
+    return segs, set(), words
+
+
+def transcribe(video, out):
+    wav = out / "audio.wav"
+    run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(wav)])
+    if ENGINE == "parakeet":
+        return transcribe_parakeet(wav, out)
+    return transcribe_whisper(wav, out)
+
+
+def block_means(th):
+    means = []
+    for by in range(0, TH, BLK):
+        for bx in range(0, TW, BLK):
+            total = 0
+            for r in range(BLK):
+                i = (by + r) * TW + bx
+                total += sum(th[i:i + BLK])
+            means.append(total / (BLK * BLK))
+    return means
+
+
+def base_times(video, dur):
+    """Every BASE_STEP_S seconds, minus near-identical screens. Returns (kept, skipped) times."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(video), "-vf",
+         f"fps=1/{BASE_STEP_S},scale={TW}:{TH}:flags=area,format=gray", "-f", "rawvideo", "-"],
+        check=True, capture_output=True).stdout
+    size = TW * TH
+    kept, skipped, last = [], [], None
+    for i in range(len(raw) // size):
+        t = min(i * BASE_STEP_S + 0.1, dur - 0.1)
+        blocks = block_means(raw[i * size:(i + 1) * size])
+        if last is None or max(abs(a - b) for a, b in zip(blocks, last)) > STATIC_DIFF:
+            kept.append(t)
+            last = blocks
+        else:
+            skipped.append(t)
+    return kept, skipped
+
+
+def frame_times(video, segs, words, dur):
+    """Must-keep moments (segment middles, pointing words, start, end) plus the base cadence."""
+    must = {round(t, 1): "" for t in [0.1, dur - 0.1] + [(a + b) / 2 for a, b, _ in segs]}
+    for t, w in words:
+        must[round(min(max(t + 0.1, 0.1), dur - 0.1), 1)] = w
+    chosen = dict(must)
+    kept, skipped = base_times(video, dur)
+    base = [t for t in kept if all(abs(t - m) >= MIN_GAP_S for m in must)]
+    room = MAX_FRAMES - len(must)
+    thinned = []
+    if room < len(base):  # thin the base cadence evenly; the must-keeps always stay
+        keep = {int(i * len(base) / room) for i in range(room)} if room > 0 else set()
+        thinned = [t for i, t in enumerate(base) if i not in keep]
+        base = [t for i, t in enumerate(base) if i in keep]
+    for t in base:
+        chosen[round(t, 1)] = ""
+    # Collapse near-duplicates, letting a pointing-word tag win.
+    out, last = {}, None
+    for t in sorted(chosen):
+        if last is not None and t - last < MIN_GAP_S and not chosen[t]:
+            continue
+        out[t] = chosen[t]
+        last = t
+    return out, skipped, thinned
+
+
+def grab(video, t, dest):
+    run(["ffmpeg", "-v", "error", "-y", "-ss", str(t), "-i", str(video), "-frames:v", "1",
+         "-vf", f"scale={FRAME_WIDTH}:-1", "-q:v", "4", "-strict", "unofficial", str(dest)])
+
+
+def main():
+    video = resolve(sys.argv[1]) if len(sys.argv) > 1 else newest_video()
+    if not video.exists():
+        sys.exit(f"Not found: {video}. Run with no argument to use the newest file in {INBOX}.")
+    out = CACHE / "".join(c if c.isalnum() else "-" for c in video.stem).strip("-")
+    out.mkdir(parents=True, exist_ok=True)
+    for old in out.glob("f_*.jpg"):
+        old.unlink()
+
+    dur = duration(video)
+    audio = has_audio(video)
+    engine_ok = MODEL.exists() if ENGINE == "whisper" else PARAKEET.exists()
+    segs, noise, words = transcribe(video, out) if audio and engine_ok else ([], set(), [])
+    tags, skipped, thinned = frame_times(video, segs, words, dur)
+    frames = {}
+    for t in tags:
+        frames[t] = out / f"f_{int(t // 60):02d}m{t % 60:04.1f}s.jpg"
+        grab(video, t, frames[t])
+
+    def line(t, p, indent="  "):
+        tag = f" [pointing: \"{tags[t]}\"]" if tags[t] else ""
+        return f"{indent}- frame @{fmt(t)}{tag}: {p}"
+
+    def times(ts, cap=30):
+        shown = ", ".join(fmt(t) for t in ts[:cap])
+        return shown + (f", and {len(ts) - cap} more" if len(ts) > cap else "")
+
+    lines = [f"# {video.name}",
+             f"Source: {video}",
+             f"Duration {fmt(dur)}. Transcribed with {ENGINE}. {len(frames)} frames: one every "
+             f"{BASE_STEP_S:g}s plus each segment and each pointing word. Read every frame, in order."]
+    if skipped:
+        lines.append(f"Not extracted because the screen barely changed from the last frame ({len(skipped)}): "
+                     f"{times(skipped)}. The threshold is coarse: a small checkbox or a short cursor move can "
+                     "slip under it, so extract any of these if the narration leaves a gap.")
+    if thinned:
+        lines.append(f"THINNED: {len(thinned)} cadence frames dropped by the WATCH_MAX_FRAMES={MAX_FRAMES} cap "
+                     f"(segment and pointing-word frames always stay, so the total can run over): "
+                     f"{times(thinned)}. Coverage there is coarser than {BASE_STEP_S:g}s.")
+    lines.append("")
+    if not segs:
+        if not audio:
+            why = "no audio track (mic off in the recording options?)"
+        elif noise:
+            why = "audio present but Whisper heard only " + ", ".join(sorted(noise)) + " (mic muted or picking up noise, not speech)"
+        else:
+            why = "audio present but no speech detected (silent mic?)"
+        lines.append(f"**NO SPEECH TRANSCRIBED: {why}. Frames only; narration intent is unknown.**\n")
+        lines += [line(t, p, "") for t, p in frames.items()]
+    else:
+        remaining = list(frames.items())
+        while remaining and remaining[0][0] < segs[0][0]:  # silence before the first word
+            t, p = remaining.pop(0)
+            lines.append(line(t, p, ""))
+        for i, (start, end, text) in enumerate(segs):
+            nxt = segs[i + 1][0] if i + 1 < len(segs) else dur + 1
+            lines.append(f"**[{fmt(start)}-{fmt(end)}]** {text}")
+            # Frames inside this segment or the silence right after it.
+            while remaining and remaining[0][0] < nxt:
+                t, p = remaining.pop(0)
+                lines.append(line(t, p))
+            lines.append("")
+    report = out / "report.md"
+    report.write_text("\n".join(lines) + "\n")
+    print(report)
+
+
+if __name__ == "__main__":
+    main()
